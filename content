@@ -1,0 +1,356 @@
+#!/opt/opsware/bin/python2
+
+import sys
+import os
+sys.path.append('/opt/opsware/pylibs2')
+
+import string
+import tempfile
+import re
+import pdb
+from optparse import OptionParser
+from subprocess import Popen, PIPE
+
+CBT_DIR="/opt/opsware/cbt"
+CBT_RUN_DIR="/var/opt/opsware/cbt_exports"
+CBT_EXPORT_DIR="%s/exports" % CBT_RUN_DIR
+CBT_IMPORT_DIR="%s/imports" % CBT_RUN_DIR
+CBT_PACKAGE_DIR="%s/packages" % CBT_RUN_DIR
+CBT_FILTER_DIR="%s/filters" % CBT_RUN_DIR
+
+def print_folderfilt(path, recurse):
+    filter_header = '<FolderFilter rdf:ID="f%s">'
+    filter_footer = '</FolderFilter>'
+    filter = """%s
+    <path>%s</path>
+    <recursive rdf:resource="&filter;%s" />
+%s
+""" % (filter_header, path, recurse, filter_footer)
+    return filter
+
+def create_resourcefilt(name, type):
+    searchtype = {
+        'policy' : ['software_policy', 'SoftwarePolicyVO.name'],
+        'osseq'  : ['os_sequence', 'SequenceVO.name']
+    }
+    from pytwist import twistserver
+    from pytwist.com.opsware.search import Filter
+    ts = twistserver.TwistServer()
+    ses = ts.search.SearchService
+    fs = ts.folder.FolderService
+    f = Filter()
+    f.expression = '%s =* "%s"' % (searchtype[type][1], name)
+    f.objectType = searchtype[type][0]
+
+    refs = ses.findObjRefs(f)
+    if len(refs) < 1:
+        print "Could not find a %s matching '%s'" % (searchtype[type][0], name)
+        return None
+    elif len(refs) > 1:
+        print "Found too many %s that matched '%s'" % (searchtype[type][0], name)
+        return None
+
+    locations = fs.getPath(refs[0])
+    path = ""
+    for location in locations:
+        if location.name == "/":
+            continue
+        path += "/%s" % location.name
+
+    filter = print_folderfilt(path, 'No')
+    return filter
+
+def debug_print(str):
+    if debug_print.debug:
+        print str
+
+def create_folderfilt(name, recurse):
+    recursive = 'No'
+    if recurse:
+        recursive = 'Yes'
+    filter = print_folderfilt(name, recursive)
+    return filter
+
+def define_filter(type, name, recurse=False):
+    if type == 'folder':
+        filter = create_folderfilt(name, recurse)
+    elif type == 'policy' or type == 'osseq':
+        filter = create_resourcefilt(name, type)
+    return filter
+
+def write_filter_file(content):
+    filter_doc_str = """<?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE rdf:RDF [
+      <!ENTITY filter "http://www.opsware.com/ns/cbt/0.1/filter#">
+      ]>
+
+      <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+               xmlns="http://www.opsware.com/ns/cbt/0.1/filter#">
+
+"""
+    (tmp_fd, tmp_file) = tempfile.mkstemp(dir=CBT_FILTER_DIR)
+    try:
+        filter_fd = os.fdopen(tmp_fd, "w")
+    except Exception, e:
+        print "Could not open %s for writing: %s" % (tmp_file, e)
+        return None
+
+    filter_fd.write(filter_doc_str)
+    filter_num = 0
+    filter_fd.write(content)
+    filter_fd.write("\n</rdf:RDF>\n")
+    filter_fd.close()
+    return tmp_file
+
+def create_filter(options):
+    filters = []
+    filter_found = False
+    if options.folders:
+        filter_found = True
+        for folder in options.folders:
+            filters.append(define_filter('folder', folder, options.recurse))
+    if options.software_policy:
+        filter_found = True
+        for policy in options.software_policy:
+            filters.append(define_filter('policy', policy))
+    if options.osseq:
+        filter_found = True
+        for osseq in options.osseq:
+            filters.append(define_filter('osseq', osseq))
+    if not filter_found:
+        print "You must specify a piece of content to create a filter for"
+        return False
+    content = ""
+    filter_seq = 0
+    for filter in filters:
+        content += filter % filter_seq
+        filter_seq += 1
+    filter_file = write_filter_file(content)
+    return filter_file
+
+def next_export(export_dir):
+    pat = re.compile("^(\S+)\.(\d+)$")
+    match = pat.search(export_dir)
+    if match:
+        export_base = match.group(1)
+        cur_expnum = int(match.group(2))
+        cur_expnum += 1
+    else:
+        cur_expnum = 1
+        export_base = export_dir
+    export_dir = "%s.%d" % (export_base, cur_expnum)
+    return export_dir
+
+def is_delta(export_dir, delta):
+    full_export_dir = CBT_EXPORT_DIR + "/" + export_dir
+    if os.path.exists(full_export_dir) and not delta:
+        incr = raw_input("The export directory already exists - did you want to do an incremental export? [y/n]: ")
+        if incr.lower() == 'y':
+            delta = True
+    return delta
+
+def determine_baseline(export_dir, delta):
+    if delta:
+        baseline_dir = export_dir
+    else:
+        baseline_dir = None
+    return baseline_dir
+     
+def determine_exportname(export_dir, delta):
+    if delta:
+        export_name = next_export(export_dir)
+    else:
+        export_name = export_dir
+    return export_name
+
+def run_cmd(cmd):
+    if debug_print.debug:
+        process = Popen(cmd)
+    else:
+        process = Popen(cmd, stdout=PIPE)
+    print "Started process with pid %s" % process.pid
+    rc = process.wait()
+    return rc
+
+def compile_exportopts(options, option_str):
+    full_export_dir = CBT_EXPORT_DIR + "/" + options.export_name
+    option_str.append("-e")
+    option_str.append(full_export_dir)
+    option_str.append("--clean")
+    option_str.append("-f")
+    option_str.append(options.filter_file)
+
+    if options.delta:
+        baseline_dir = CBT_EXPORT_DIR + "/" + options.baseline
+        option_str.append("--incremental")
+        option_str.append("--baseline")
+        option_str.append(baseline_dir)
+        if options.delete:
+            option_str.append("--delete")
+    return option_str
+
+def compile_importopts(options, option_str):
+    short_name = get_short_name(options.file)
+    import_dir = CBT_IMPORT_DIR + "/" + short_name
+    option_str.append("-i")
+    option_str.append(import_dir)
+    option_str.append("-p")
+    option_str.append(options.policy)
+    if options.noop:
+        option_str.append("--noop")
+    if options.delete:
+        option_str.append("--delete")
+    return option_str
+    
+def compile_options(options):
+    cbt_cfg = "%s/cbt.cfg" % CBT_DIR
+    cbt_bin = "%s/bin/cbt" % CBT_DIR
+    option_str = [cbt_bin,"-cf",cbt_cfg]
+    if not options.debug:
+        option_str.append("--np")
+    if options.email:
+        option_str.append('--email')
+        option_str.append(options.email)
+        option_str.append('--emaillog')
+    if options.command == 'export':
+        option_str = compile_exportopts(options, option_str)
+    elif options.command == 'import':
+        option_str = compile_importopts(options, option_str)
+    return option_str
+
+def get_short_name(name):
+    match = re.match("(?:.*\/)?(.*)\.tar\.gz", name)
+    if match:
+        short_name = match.group(1)
+        return short_name
+    else:
+        return None
+    
+def package_content(export_name):
+    package_name = CBT_PACKAGE_DIR + "/" + export_name + ".tar.gz"
+    args = ["tar", "-C", CBT_EXPORT_DIR, "-czvf", package_name, export_name]
+    rc = run_cmd(args)
+    if rc == 0:
+        print "Wrote package %s" % package_name
+    else:
+        print "Failed to create package. Please see log"
+    return
+
+def unpackage_content(package):
+    short_name = get_short_name(package)
+    if not short_name:
+        print "Could not determine short name for package"
+        return None
+    args = ["tar", "-C", CBT_IMPORT_DIR, "-xzvf", package]
+    rc = run_cmd(args)
+    if rc == 0:
+        print "Unpackaged content to %s/%s" % (CBT_IMPORT_DIR, short_name)
+
+def defineParser(command):
+    parser = OptionParser()
+    parser.add_option("-e","--email",help="Email address if you want the log emailed to you")
+    parser.add_option("--debug",action="store_true",help="Debug mode")
+    if command == 'import':
+        usage = "content import [-p import_policy] -f FILE"
+        parser.set_usage(usage)
+        parser.add_option('-p','--policy',default='skip',
+            help='Specifies the policy to use while importing.  Valid values are skip, '
+            ' overwrite or duplicate.  Defaults to skip')
+        parser.add_option('-f','--file',help='Location of gzip\'d tarball of exported content')
+        parser.add_option('--delete',help="Delete objects marked deleted by the export")
+        parser.add_option('--noop',action='store_true',help='Run the import in a "dry run" mode')
+    elif command == 'export':
+        usage = "content export [-f FOLDER -f FOLDER -r] [-s POLICY] [-o OSSEQUENCE]"
+        parser.set_usage(usage)
+        parser.add_option('-f','--folder',dest='folders',action='append',help='Export all resources in a folder')
+        parser.add_option('-r','--recurse',action='store_true',
+            help='Recurse the folder for all resources.  This applies to all folder resources given')
+        parser.add_option('-d','--delta',action='store_true',
+            help='Perform a delta export, only exporting items that have changed.')
+        parser.add_option('--delete',action='store_true',
+            help='Mark any content in the export that is in the baseline but not included by the filter as DELTED.  Must be used with the --delta option')
+        parser.add_option('-s','--policy',dest='software_policy',action='append',
+            help='Export a software policy')
+        parser.add_option('-o','--osseq',action='append',help='Export an OS sequence')
+        parser.add_option('-n','--name',help='Store exported content as NAME.tar.gz. Content will '
+            'automatically be tar\'d and gzip\'d')
+    return parser
+
+def printUsage(command=None):
+    if not command:
+        print "EXPORTING CONTENT"
+        printUsage('export')
+        print ""
+        print "IMPORTING CONTENT"
+        printUsage('import')
+        return
+
+    if command == 'export':
+        parser = defineParser('export')
+        parser.print_help()
+    elif command == 'import':
+        parser = defineParser('import')
+        parser.print_help()
+    else:
+        printUsage()
+    
+def parse_args(args):
+    if len(args) < 2: 
+        printUsage()
+        return None 
+    command = args[1]
+    if len(args) <= 3:
+        printUsage(command)
+        return None
+
+    args = args[2:]
+    parser = defineParser(command)
+    (options, args) = parser.parse_args(args)
+    options.command = command
+    return options
+
+def main(args):
+    options = parse_args(args)
+    if not options:
+        return 1
+    if options.debug:
+        debug_print.debug = True
+    else:
+        debug_print.debug = False
+
+    if options.command == 'export':
+        if not options.name:
+            print "You must specify a name for the export"
+            return 1
+        options.filter_file = create_filter(options)
+        if not options.filter_file:
+            return 1
+        print "Wrote filter to %s" % options.filter_file
+        print "Exporting content"
+        options.delta = is_delta(options.name, options.delta)
+        debug_print("Delta is set to %s" % options.delta)
+        options.export_name = determine_exportname(options.name, options.delta)
+        debug_print("Export Name is %s" % options.export_name)
+        options.baseline = determine_baseline(options.name, options.delta)
+        debug_print("Baseline name is: %s" % options.baseline)
+        cbt_cmd = compile_options(options)
+        debug_print("Running %s" % string.join(cbt_cmd))
+        rc = run_cmd(cbt_cmd)
+        if rc == 0:
+            print "Packaging content"
+            rc = package_content(options.export_name)
+        else:
+            print "Could not export content. See log for details"
+            return 1
+    elif options.command == 'import':
+        if not options.file:
+            print "You must specify a file for the import"
+            return 1
+        debug_print("Unpackaging %s" % options.file)
+        unpackage_content(options.file)
+        cbt_cmd = compile_options(options)
+        debug_print("Running %s" % string.join(cbt_cmd))
+        rc = run_cmd(cbt_cmd)
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
