@@ -1,4 +1,4 @@
-* Wrapper for cbt export and import *
+h2. Wrapper for cbt export and import
 
 You can configure two aspects for the script:
 
