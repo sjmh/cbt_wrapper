@@ -1,9 +1,10 @@
-h2. Wrapper for cbt export and import
+Wrapper for cbt export and import
+--------
 
 You can configure two aspects for the script:
 
-a) The 'run' directory.  This is where the packages, filters and such will go.
-b) The 'cbt' directory.  This is where the cbt binaries and cbt.cfg usually 
+* The 'run' directory.  This is where the packages, filters and such will go.
+* The 'cbt' directory.  This is where the cbt binaries and cbt.cfg usually 
    reside.
 
 The 'run' directory can be created by ( feel free to change the main dir ):
